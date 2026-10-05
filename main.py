@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -9,14 +10,6 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery, ChatPermissions,
     InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated,
-)
-
-from db import (
-    init_db, save_chat, add_punishment, get_warns, clear_warns,
-)
-from utils import (
-    parse_duration, human_duration,
-    parse_target, resolve_user, is_admin,
 )
 
 
@@ -39,6 +32,69 @@ UNMUTE_PERMS = ChatPermissions(
 )
 
 _BOT_USERNAME = "DiplomatBot"
+
+# Варны в памяти (сбрасываются при рестарте)
+warns_store: dict[tuple[int, int], int] = {}
+
+
+# ====================== ХЕЛПЕРЫ ======================
+def parse_duration(value, unit):
+    if not value or not value.isdigit():
+        return None
+    n = int(value)
+    if n == 0:
+        return None
+    delta = timedelta(days=n) if unit == "days" else timedelta(minutes=n)
+    return datetime.utcnow() + delta
+
+
+def human_duration(until, unit):
+    if until is None:
+        return "навсегда"
+    total = int((until - datetime.utcnow()).total_seconds())
+    if unit == "days":
+        return f"{max(1, total // 86400)} дн."
+    return f"{max(1, total // 60)} мин."
+
+
+async def parse_target(message, args):
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return (message.reply_to_message.from_user.id,
+                message.reply_to_message.from_user.username, args)
+    if not args:
+        return None, None, args
+    first = args[0]
+    if first.startswith("@"):
+        return None, first[1:], args[1:]
+    if first.isdigit() and len(first) >= 5:
+        return int(first), None, args[1:]
+    return None, None, args
+
+
+async def resolve_user(message, bot, user_id, username):
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user
+    if username:
+        try:
+            m = await bot.get_chat_member(message.chat.id, f"@{username}")
+            return m.user
+        except Exception:
+            return None
+    if user_id:
+        try:
+            m = await bot.get_chat_member(message.chat.id, user_id)
+            return m.user
+        except Exception:
+            return None
+    return None
+
+
+async def is_admin(bot, chat_id, user_id):
+    try:
+        m = await bot.get_chat_member(chat_id, user_id)
+        return m.status in ("administrator", "creator")
+    except Exception:
+        return False
 
 
 # ====================== КЛАВИАТУРЫ ======================
@@ -146,8 +202,6 @@ async def cmd_ban(message: Message):
         await message.reply(f"❌ Не смог забанить: {e}")
         return
 
-    await add_punishment(message.chat.id, target.id,
-                         message.from_user.id, "ban", until, reason)
     await message.answer(
         f"🔨 <b>{target.full_name}</b> забанен\n"
         f"⏱ Срок: {human_duration(until, 'days')}\n"
@@ -180,8 +234,6 @@ async def cmd_mute(message: Message):
         await message.reply(f"❌ Не смог замутить: {e}")
         return
 
-    await add_punishment(message.chat.id, target.id,
-                         message.from_user.id, "mute", until, reason)
     await message.answer(
         f"🔇 <b>{target.full_name}</b> замучен\n"
         f"⏱ Срок: {human_duration(until, 'minutes')}\n"
@@ -209,8 +261,6 @@ async def cmd_kick(message: Message):
         await message.reply(f"❌ Не смог кикнуть: {e}")
         return
 
-    await add_punishment(message.chat.id, target.id,
-                         message.from_user.id, "kick", None, reason)
     await message.answer(
         f"👢 <b>{target.full_name}</b> кикнут\n"
         f"📝 Причина: {reason}",
@@ -230,15 +280,15 @@ async def cmd_warn(message: Message):
         return
 
     reason = " ".join(rest) if rest else "не указана"
-    await add_punishment(message.chat.id, target.id,
-                         message.from_user.id, "warn", None, reason)
-    count = await get_warns(message.chat.id, target.id)
+    key = (message.chat.id, target.id)
+    warns_store[key] = warns_store.get(key, 0) + 1
+    count = warns_store[key]
 
     if count >= WARN_LIMIT:
         try:
             await bot.ban_chat_member(message.chat.id, target.id)
             await bot.unban_chat_member(message.chat.id, target.id)
-            await clear_warns(message.chat.id, target.id)
+            warns_store.pop(key, None)
         except Exception:
             pass
         await message.answer(
@@ -298,7 +348,7 @@ async def cmd_unwarn(message: Message):
     if not target:
         await message.reply("❌ Укажи юзера.")
         return
-    await clear_warns(message.chat.id, target.id)
+    warns_store.pop((message.chat.id, target.id), None)
     await message.answer(f"✅ Варны <b>{target.full_name}</b> сброшены")
 
 
@@ -308,7 +358,6 @@ async def on_bot_added(event: ChatMemberUpdated):
     chat = event.chat
     if chat.type not in ("group", "supergroup"):
         return
-    await save_chat(chat.id, chat.title or "")
     if event.new_chat_member.status == "member":
         try:
             me = await bot.get_chat_member(chat.id, bot.id)
@@ -328,7 +377,6 @@ async def on_bot_added(event: ChatMemberUpdated):
 # ====================== ЗАПУСК ======================
 async def main():
     global _BOT_USERNAME
-    await init_db()
     me = await bot.get_me()
     _BOT_USERNAME = me.username
     await bot.delete_webhook(drop_pending_updates=True)
